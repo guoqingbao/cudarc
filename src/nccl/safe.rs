@@ -14,6 +14,8 @@ pub struct Comm {
     world_size: usize,
 }
 
+unsafe impl Send for Comm {}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Id {
     id: sys::ncclUniqueId,
