@@ -254,6 +254,16 @@ impl<T> Drop for CudaSlice<T> {
         self.device.bind_to_thread().unwrap();
         unsafe {
             if self.device.is_async {
+                #[cfg(feature = "graph")]
+                if super::capture_status(self.device.stream)
+                    == Ok(sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+                {
+                    // Do not drop since we used memory pool during graph capturing
+                    // println!("do not free during graph capture!");
+                } else {
+                    result::free_async(self.cu_device_ptr, self.device.stream).unwrap();
+                }
+                #[cfg(not(feature = "graph"))]
                 result::free_async(self.cu_device_ptr, self.device.stream).unwrap();
             } else {
                 result::free_sync(self.cu_device_ptr).unwrap();

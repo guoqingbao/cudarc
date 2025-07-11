@@ -49,6 +49,7 @@ nccl = ["driver"]
 std = []
 no-std = ["no-std-compat/std", "dep:spin"]
 f16 = ["dep:half"]
+graph = []
 
 [dependencies]
 spin = { version = "0.9.8", optional = true, features = [

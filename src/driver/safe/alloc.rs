@@ -135,6 +135,21 @@ impl CudaDevice {
     ) -> Result<CudaSlice<T>, result::DriverError> {
         self.bind_to_thread()?;
         let cu_device_ptr = if self.is_async {
+            #[cfg(feature = "graph")]
+            if super::capture_status(self.stream)
+                == Ok(sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+            {
+                // malloc from memory pool instead during graph capturing
+                // println!("malloc from pool, size {}", len * std::mem::size_of::<T>());
+                result::malloc_pool_async(
+                    self.cu_device,
+                    self.stream,
+                    len * std::mem::size_of::<T>(),
+                )?
+            } else {
+                result::malloc_async(self.stream, len * std::mem::size_of::<T>())?
+            }
+            #[cfg(not(feature = "graph"))]
             result::malloc_async(self.stream, len * std::mem::size_of::<T>())?
         } else {
             result::malloc_sync(len * std::mem::size_of::<T>())?
@@ -281,15 +296,39 @@ impl CudaDevice {
         dst: &mut CudaSlice<T>,
     ) -> Result<(), result::DriverError> {
         assert_eq!(src.len(), dst.len());
-        dst.host_buf = Some(Pin::new(src));
         self.bind_to_thread()?;
+
+        #[cfg(feature = "graph")]
+        let size = src.len() * std::mem::size_of::<T>();
         if self.is_async {
             unsafe {
-                result::memcpy_htod_async(
-                    dst.cu_device_ptr,
-                    dst.host_buf.as_ref().unwrap(),
-                    self.stream,
-                )
+                #[cfg(feature = "graph")]
+                if super::capture_status(self.stream)
+                    == Ok(sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+                {
+                    // we do not release the host buffer until graph captured and no long need graph reply
+                    // println!("htod_copy_into, use temp host buffer (size {size})");
+                    let host_buffer =
+                        result::malloc_host(size, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
+                    std::ptr::copy(src.as_ptr() as *mut std::ffi::c_void, host_buffer, size);
+                    result::memcpy_htod_ptr_async(dst.cu_device_ptr, host_buffer, size, self.stream)
+                } else {
+                    dst.host_buf = Some(Pin::new(src));
+                    result::memcpy_htod_async(
+                        dst.cu_device_ptr,
+                        dst.host_buf.as_ref().unwrap(),
+                        self.stream,
+                    )
+                }
+                #[cfg(not(feature = "graph"))]
+                {
+                    dst.host_buf = Some(Pin::new(src));
+                    result::memcpy_htod_async(
+                        dst.cu_device_ptr,
+                        dst.host_buf.as_ref().unwrap(),
+                        self.stream,
+                    )
+                }
             }?
         } else {
             unsafe { result::memcpy_htod_sync(dst.cu_device_ptr, dst.host_buf.as_ref().unwrap()) }?
