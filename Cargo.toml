@@ -55,6 +55,7 @@ cusolvermg = ["cusolver"]
 std = []
 no-std = ["no-std-compat/std"]
 f16 = ["dep:half"]
+graph = []
 
 [dependencies]
 no-std-compat = { version = "0.4.1", optional = true, features = ["alloc"] }

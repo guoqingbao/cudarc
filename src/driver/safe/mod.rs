@@ -18,3 +18,17 @@ pub use self::launch::{LaunchArgs, LaunchConfig, PushKernelArg};
 pub use self::profile::{profiler_start, profiler_stop, Profiler};
 pub use self::unified_memory::UnifiedSlice;
 pub use crate::driver::result::DriverError;
+use crate::driver::{result, sys};
+
+pub fn capture_status(
+    stream: sys::CUstream,
+) -> Result<sys::CUstreamCaptureStatus, result::DriverError> {
+    // self.ctx.bind_to_thread()?;
+    let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    unsafe {
+        sys::lib()
+            .cuStreamIsCapturing(stream, &mut status)
+            .result()?;
+    }
+    Ok(status)
+}

@@ -504,6 +504,15 @@ impl<T> Drop for CudaSlice<T> {
         if let Some(write) = self.write.as_ref() {
             ctx.record_err(self.stream.wait(write));
         }
+        #[cfg(feature = "graph")]
+        if super::capture_status(self.device.stream)
+            == Ok(sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE) {
+                // Do not drop since we used memory pool during graph capturing
+                // println!("do not free during graph capture!");
+        } else {
+            ctx.record_err(unsafe { result::free_async(self.cu_device_ptr, self.stream.cu_stream) });
+        }
+        #[cfg(not(feature = "graph"))]
         ctx.record_err(unsafe { result::free_async(self.cu_device_ptr, self.stream.cu_stream) });
     }
 }

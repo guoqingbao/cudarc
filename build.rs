@@ -97,6 +97,16 @@ fn cuda_version_from_build_system() -> (usize, usize) {
         .output()
         .expect("Failed to execute `nvcc`");
 
+    //retry
+    let output = if !output.status.success() {
+        std::process::Command::new("/usr/local/cuda/bin/nvcc")
+            .arg("--version")
+            .output()
+            .expect("Failed to execute `nvcc`")
+    } else {
+        output
+    };
+
     if !output.status.success() {
         panic!(
             "`nvcc --version` failed.\nstdout:\n{}\n\nstderr:\n{}",
