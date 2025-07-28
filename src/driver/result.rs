@@ -642,6 +642,23 @@ pub unsafe fn malloc_pool_async(
     Ok(dev_ptr.assume_init())
 }
 
+pub unsafe fn malloc_pool_async(
+    device: sys::CUdevice,
+    stream: sys::CUstream,
+    num_bytes: usize,
+) -> Result<sys::CUdeviceptr, DriverError> {
+    use crate::driver::sys::CUmemoryPool;
+    let mut pool: CUmemoryPool = std::ptr::null_mut();
+    lib()
+        .cuDeviceGetDefaultMemPool(&mut pool, device)
+        .result()?;
+    let mut dev_ptr = MaybeUninit::uninit();
+    lib()
+        .cuMemAllocFromPoolAsync(dev_ptr.as_mut_ptr(), num_bytes, pool, stream)
+        .result()?;
+    Ok(dev_ptr.assume_init())
+}
+
 /// Allocates memory
 ///
 /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1gb82d2a09844a58dd9e744dc31e8aa467)
@@ -833,6 +850,15 @@ pub unsafe fn memcpy_htod_ptr_async(
     stream: sys::CUstream,
 ) -> Result<(), DriverError> {
     sys::cuMemcpyHtoDAsync_v2(dst, src, size, stream).result()
+}
+
+pub unsafe fn memcpy_htod_ptr_async(
+    dst: sys::CUdeviceptr,
+    src: *const std::ffi::c_void,
+    size: usize,
+    stream: sys::CUstream,
+) -> Result<(), DriverError> {
+    lib().cuMemcpyHtoDAsync_v2(dst, src, size, stream).result()
 }
 
 /// Copies memory from Host to Device
