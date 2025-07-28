@@ -634,12 +634,10 @@ pub unsafe fn malloc_pool_async(
 ) -> Result<sys::CUdeviceptr, DriverError> {
     use crate::driver::sys::CUmemoryPool;
     let mut pool: CUmemoryPool = std::ptr::null_mut();
-    lib()
-        .cuDeviceGetDefaultMemPool(&mut pool, device)
+    sys::cuDeviceGetDefaultMemPool(&mut pool, device)
         .result()?;
     let mut dev_ptr = MaybeUninit::uninit();
-    lib()
-        .cuMemAllocFromPoolAsync(dev_ptr.as_mut_ptr(), num_bytes, pool, stream)
+    sys::cuMemAllocFromPoolAsync(dev_ptr.as_mut_ptr(), num_bytes, pool, stream)
         .result()?;
     Ok(dev_ptr.assume_init())
 }
@@ -834,7 +832,7 @@ pub unsafe fn memcpy_htod_ptr_async(
     size: usize,
     stream: sys::CUstream,
 ) -> Result<(), DriverError> {
-    lib().cuMemcpyHtoDAsync_v2(dst, src, size, stream).result()
+    sys::cuMemcpyHtoDAsync_v2(dst, src, size, stream).result()
 }
 
 /// Copies memory from Host to Device

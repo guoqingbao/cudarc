@@ -26,8 +26,7 @@ pub fn capture_status(
     // self.ctx.bind_to_thread()?;
     let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
     unsafe {
-        sys::lib()
-            .cuStreamIsCapturing(stream, &mut status)
+        sys::cuStreamIsCapturing(stream, &mut status)
             .result()?;
     }
     Ok(status)
