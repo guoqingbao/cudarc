@@ -194,6 +194,27 @@ impl CudaDevice {
         Ok(dst)
     }
 
+    pub fn alloc_empty<T: ValidAsZeroBits + DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+        sync_alloc: bool,
+    ) -> Result<CudaSlice<T>, result::DriverError> {
+        let dst = if sync_alloc {
+            unsafe {
+                let cu_device_ptr = result::malloc_sync(len * std::mem::size_of::<T>())?;
+                CudaSlice {
+                    cu_device_ptr,
+                    len,
+                    device: self.clone(),
+                    host_buf: None,
+                }
+            }
+        } else {
+            unsafe { self.alloc(len) }?
+        };
+        Ok(dst)
+    }
+
     /// Sets all memory to 0 asynchronously.
     ///
     /// # Safety
