@@ -188,18 +188,9 @@ impl CudaDevice {
     pub fn alloc_zeros<T: ValidAsZeroBits + DeviceRepr>(
         self: &Arc<Self>,
         len: usize,
-    ) -> Result<CudaSlice<T>, result::DriverError> {
-        let mut dst = unsafe { self.alloc(len) }?;
-        self.memset_zeros(&mut dst)?;
-        Ok(dst)
-    }
-
-    pub fn alloc_empty<T: ValidAsZeroBits + DeviceRepr>(
-        self: &Arc<Self>,
-        len: usize,
         sync_alloc: bool,
     ) -> Result<CudaSlice<T>, result::DriverError> {
-        let dst = if sync_alloc {
+        let mut dst = if sync_alloc {
             unsafe {
                 let cu_device_ptr = result::malloc_sync(len * std::mem::size_of::<T>())?;
                 CudaSlice {
@@ -212,6 +203,7 @@ impl CudaDevice {
         } else {
             unsafe { self.alloc(len) }?
         };
+        self.memset_zeros(&mut dst)?;
         Ok(dst)
     }
 
