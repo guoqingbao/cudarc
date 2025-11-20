@@ -1,104 +1,11 @@
-use crate::driver::{result, sys};
+use std::vec::Vec;
 
-use super::alloc::DeviceRepr;
-use super::core::{CudaDevice, CudaFunction, CudaModule, CudaStream};
+use crate::driver::{
+    result::{self, DriverError},
+    sys,
+};
 
-use std::{sync::Arc, vec::Vec};
-
-impl CudaDevice {
-    /// Whether a module and function are currently loaded into the device.
-    pub fn has_func(self: &Arc<Self>, module_name: &str, func_name: &str) -> bool {
-        let modules = self.modules.read();
-        #[cfg(not(feature = "no-std"))]
-        let modules = modules.unwrap();
-
-        modules
-            .get(module_name)
-            .is_some_and(|module| module.has_func(func_name))
-    }
-
-    /// Retrieves a [CudaFunction] that was registered under `module_name` and `func_name`.
-    pub fn get_func(self: &Arc<Self>, module_name: &str, func_name: &str) -> Option<CudaFunction> {
-        let modules = self.modules.read();
-        #[cfg(not(feature = "no-std"))]
-        let modules = modules.unwrap();
-
-        modules
-            .get(module_name)
-            .and_then(|m| m.get_func(func_name))
-            .map(|cu_function| CudaFunction {
-                cu_function,
-                device: self.clone(),
-            })
-    }
-}
-
-impl CudaModule {
-    /// Returns reference to function with `name`. If function
-    /// was not already loaded into CudaModule, then `None`
-    /// is returned.
-    pub(crate) fn get_func(&self, name: &str) -> Option<sys::CUfunction> {
-        self.functions.get(name).cloned()
-    }
-
-    pub(crate) fn has_func(&self, name: &str) -> bool {
-        self.functions.contains_key(name)
-    }
-}
-
-impl CudaFunction {
-    #[inline(always)]
-    unsafe fn launch_async_impl(
-        self,
-        cfg: LaunchConfig,
-        params: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.device.bind_to_thread()?;
-        result::launch_kernel(
-            self.cu_function,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            self.device.stream,
-            params,
-        )
-    }
-
-    #[inline(always)]
-    unsafe fn launch_cooperative_async_impl(
-        self,
-        cfg: LaunchConfig,
-        params: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.device.bind_to_thread()?;
-        result::launch_cooperative_kernel(
-            self.cu_function,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            self.device.stream,
-            params,
-        )
-    }
-
-    #[inline(always)]
-    unsafe fn par_launch_async_impl(
-        self,
-        stream: &CudaStream,
-        cfg: LaunchConfig,
-        params: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.device.bind_to_thread()?;
-        result::launch_kernel(
-            self.cu_function,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            stream.stream,
-            params,
-        )
-    }
-}
+use super::{CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceRepr};
 
 /// Configuration for [result::launch_kernel]
 ///
@@ -132,371 +39,298 @@ impl LaunchConfig {
     }
 }
 
-/// Consumes a [CudaFunction] to execute asychronously on the device with
-/// params determined by generic parameter `Params`.
+/// The kernel launch builder. Instantiate with [CudaStream::launch_builder()], and then
+/// launch the kernel with [LaunchArgs::launch()]
 ///
-/// This is impl'd multiple times for different number and types of params. In
-/// general, `Params` should impl [DeviceRepr].
+/// Anything added as a kernel argument with [LaunchArgs::arg()] must either:
+/// 1. Implement [DeviceRepr]
+/// 2. Add a custom implementation of `impl<'a> PushKernelArg<T> for LaunchArgs<'a>`, where `T` is your type.
+#[derive(Debug)]
+pub struct LaunchArgs<'a> {
+    pub(super) stream: &'a CudaStream,
+    pub(super) func: &'a CudaFunction,
+    pub(super) waits: Vec<&'a CudaEvent>,
+    pub(super) records: Vec<&'a CudaEvent>,
+    pub(super) args: Vec<*mut std::ffi::c_void>,
+    pub(super) flags: Option<sys::CUevent_flags>,
+}
+
+impl CudaStream {
+    /// Creates a new kernel launch builder that will launch `func` on stream `self`.
+    ///
+    /// Add arguments to the builder using [LaunchArgs::arg()], and submit it to the stream
+    /// using [LaunchArgs::launch()].
+    pub fn launch_builder<'a>(&'a self, func: &'a CudaFunction) -> LaunchArgs<'a> {
+        LaunchArgs {
+            stream: self,
+            func,
+            waits: Vec::new(),
+            records: Vec::new(),
+            args: Vec::new(),
+            flags: None,
+        }
+    }
+}
+
+/// Something that can be copied to device memory and
+/// turned into a parameter for [result::launch_kernel].
 ///
-/// ```ignore
-/// # use cudarc::driver::*;
-/// # let dev = CudaDevice::new(0).unwrap();
-/// let my_kernel: CudaFunction = dev.get_func("my_module", "my_kernel").unwrap();
-/// let cfg: LaunchConfig = LaunchConfig {
-///     grid_dim: (1, 1, 1),
-///     block_dim: (1, 1, 1),
-///     shared_mem_bytes: 0,
-/// };
-/// let params = (1i32, 2u64, 3usize);
-/// unsafe { my_kernel.launch(cfg, params) }.unwrap();
-/// ```
+/// See the [cuda docs](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#global-function-argument-processing)
+/// on argument processing.
 ///
 /// # Safety
 ///
-/// This is not safe really ever, because there's no garuntee that `Params`
-/// will work for any [CudaFunction] passed in. Great care should be taken
-/// to ensure that [CudaFunction] works with `Params` and that the correct
-/// parameters have `&mut` in front of them.
+/// This is unsafe you need to ensure that T can be represented
+/// in CUDA and also references to it can be properly passed to CUDA.
 ///
-/// Additionally, kernels can mutate data that is marked as immutable,
-/// such as `&CudaSlice<T>`.
-///
-/// See [LaunchAsync::launch] for more details
-pub unsafe trait LaunchAsync<Params> {
-    /// Launches the [CudaFunction] with the corresponding `Params`.
+/// Most implementations will be required to use `#[inline(always)]`
+/// to ensure that references are handled properly.
+pub unsafe trait PushKernelArg<T> {
+    fn arg(&mut self, arg: T) -> &mut Self;
+}
+
+unsafe impl<'a, 'b: 'a, T: DeviceRepr> PushKernelArg<&'b T> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b T) -> &mut Self {
+        self.args.push(arg as *const T as *mut _);
+        self
+    }
+}
+
+unsafe impl<'a, 'b: 'a, T> PushKernelArg<&'b CudaSlice<T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b CudaSlice<T>) -> &mut Self {
+        if self.stream.context().is_in_multi_stream_mode() {
+            if let Some(write) = arg.write.as_ref() {
+                self.waits.push(write);
+            }
+            if let Some(read) = arg.read.as_ref() {
+                self.records.push(read);
+            }
+        }
+        self.args
+            .push((&arg.cu_device_ptr) as *const sys::CUdeviceptr as _);
+        self
+    }
+}
+
+unsafe impl<'a, 'b: 'a, T> PushKernelArg<&'b mut CudaSlice<T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut CudaSlice<T>) -> &mut Self {
+        if self.stream.context().is_in_multi_stream_mode() {
+            if let Some(read) = arg.read.as_ref() {
+                self.waits.push(read);
+            }
+            if let Some(write) = arg.write.as_ref() {
+                self.waits.push(write);
+                self.records.push(write);
+            }
+        }
+        self.args
+            .push((&arg.cu_device_ptr) as *const sys::CUdeviceptr as _);
+        self
+    }
+}
+
+unsafe impl<'a, 'b: 'a, 'c: 'b, T> PushKernelArg<&'b CudaView<'c, T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b CudaView<'c, T>) -> &mut Self {
+        if self.stream.context().is_in_multi_stream_mode() {
+            if let Some(write) = arg.write.as_ref() {
+                self.waits.push(write);
+            }
+            if let Some(read) = arg.read.as_ref() {
+                self.records.push(read);
+            }
+        }
+        self.args.push((&arg.ptr) as *const sys::CUdeviceptr as _);
+        self
+    }
+}
+
+unsafe impl<'a, 'b: 'a, 'c: 'b, T> PushKernelArg<&'b mut CudaViewMut<'c, T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut CudaViewMut<'c, T>) -> &mut Self {
+        if self.stream.context().is_in_multi_stream_mode() {
+            if let Some(read) = arg.read.as_ref() {
+                self.waits.push(read);
+            }
+            if let Some(write) = arg.write.as_ref() {
+                self.waits.push(write);
+                self.records.push(write);
+            }
+        }
+        self.args.push((&arg.ptr) as *const sys::CUdeviceptr as _);
+        self
+    }
+}
+
+impl LaunchArgs<'_> {
+    /// Calling this will make [LaunchArgs::launch()] and [LaunchArgs::launch_cooperative()]
+    /// return 2 [CudaEvent]s that recorded before and after the kernel is submitted.
+    pub fn record_kernel_launch(&mut self, flags: sys::CUevent_flags) -> &mut Self {
+        self.flags = Some(flags);
+        self
+    }
+
+    /// Submits the configuration [CudaFunction] to execute asychronously on
+    /// the configured device stream.
     ///
     /// # Safety
     ///
-    /// This method is **very** unsafe.
+    /// This is generally unsafe for two main reasons:
     ///
-    /// See cuda documentation notes on this as well:
-    /// <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#functions>
+    /// 1. We can't guarantee that the arguments are valid for the configured [CudaFunction].
+    ///    We don't know if the types are correct, if the arguments are in the correct order,
+    ///    if the types are representable in CUDA, etc.
+    /// 2. We can't guarantee that the cuda kernel follows the mutability of the arguments
+    ///    configured with [LaunchArgs::arg()]. For instance, you can pass a reference to a [CudaSlice],
+    ///    which on rust side can't be mutated, but on cuda side the kernel can mutate it.
+    /// 3. [CudaFunction] can access memory outside of limits.
     ///
-    /// 1. `params` can be changed regardless of `&` or `&mut` usage.
-    /// 2. `params` will be changed at some later point after the
-    ///    function returns because the kernel is executed async.
-    /// 3. There are no guaruntees that the `params`
-    ///    are the correct number/types/order for `func`.
-    /// 4. Specifying the wrong values for [LaunchConfig] can result
-    ///    in accessing/modifying values past memory limits.
+    /// ## Handling asynchronous mutation
     ///
-    /// ## Asynchronous mutation
+    /// All [CudaSlice]/[CudaView]/[CudaViewMut] contain 2 events that record
+    /// when the data associated with them are read from/written to.
     ///
-    /// Since this library queues kernels to be launched on a single
-    /// stream, and really the only way to modify [crate::driver::CudaSlice] is through
-    /// kernels, mutating the same [crate::driver::CudaSlice] with multiple kernels
-    /// is safe. This is because each kernel is executed sequentially
-    /// on the stream.
+    /// The [PushKernelArg] implementation of these adds these events to [LaunchArgs],
+    /// so when [LaunchArgs::launch()] is called, we properly do multi stream synchronization.
     ///
-    /// **Modifying a value on the host that is in used by a
-    /// kernel is undefined behavior.** But is hard to do
-    /// accidentally.
+    /// So in practice it is not possible to have multiple kernels concurrently modify device
+    /// data while using the safe api.
     ///
-    /// Also for this reason, do not pass in any values to kernels
-    /// that can be modified on the host. This is the reason
-    /// [DeviceRepr] is not implemented for rust primitive
-    /// references.
+    /// ## Handling use after free
     ///
-    /// ## Use after free
-    ///
-    /// Since the drop implementation for [crate::driver::CudaSlice] also occurs
-    /// on the device's single stream, any kernels launched before
-    /// the drop will complete before the value is actually freed.
-    ///
-    /// **If you launch a kernel or drop a value on a different stream
-    /// this may not hold**
-    unsafe fn launch(self, cfg: LaunchConfig, params: Params) -> Result<(), result::DriverError>;
+    /// Since [LaunchArgs::launch()] properly records reads/writes for [CudaSlice]/[CudaView]/[CudaViewMut],
+    /// and the drop implementation of [CudaSlice] waits on those events to finish,
+    /// we will never encounter a use after free situation.
+    #[inline(always)]
+    pub unsafe fn launch(
+        &mut self,
+        cfg: LaunchConfig,
+    ) -> Result<Option<(CudaEvent, CudaEvent)>, DriverError> {
+        self.stream.ctx.bind_to_thread()?;
+        for &event in self.waits.iter() {
+            self.stream.wait(event)?;
+        }
+        let start_event = self
+            .flags
+            .map(|flags| self.stream.record_event(Some(flags)))
+            .transpose()?;
+        result::launch_kernel(
+            self.func.cu_function,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            self.stream.cu_stream,
+            &mut self.args,
+        )?;
+        let end_event = self
+            .flags
+            .map(|flags| self.stream.record_event(Some(flags)))
+            .transpose()?;
+        for &event in self.records.iter() {
+            event.record(self.stream)?;
+        }
+        Ok(start_event.zip(end_event))
+    }
 
-    /// Launch the function on a stream concurrent to the device's default
-    /// work stream.
+    /// Launch a cooperative kernel.
     ///
     /// # Safety
-    /// This method is even more unsafe than [LaunchAsync::launch], all the same rules apply,
-    /// except now things are executing in parallel to each other.
-    ///
-    /// That means that if any of the kernels modify the same memory location, you'll get race
-    /// conditions or potentially undefined behavior.
-    unsafe fn launch_on_stream(
-        self,
-        stream: &CudaStream,
-        cfg: LaunchConfig,
-        params: Params,
-    ) -> Result<(), result::DriverError>;
-
-    /// Launch the cooperative function on a stream concurrent to the device's default
-    /// work stream.
-    ///
-    /// # Safety
-    /// This method is even more unsafe than [LaunchAsync::launch_cooperative], all the same rules apply,
-    /// except now things are executing in parallel to each other.
-    ///
-    /// That means that if any of the kernels modify the same memory location, you'll get race
-    /// conditions or potentially undefined behavior.
-    unsafe fn launch_cooperative(
-        self,
-        cfg: LaunchConfig,
-        params: Params,
-    ) -> Result<(), result::DriverError>;
-}
-
-unsafe impl LaunchAsync<&mut [*mut std::ffi::c_void]> for CudaFunction {
+    /// See [LaunchArgs::launch()]
     #[inline(always)]
-    unsafe fn launch(
-        self,
+    pub unsafe fn launch_cooperative(
+        &mut self,
         cfg: LaunchConfig,
-        args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.launch_async_impl(cfg, args)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_on_stream(
-        self,
-        stream: &CudaStream,
-        cfg: LaunchConfig,
-        args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.par_launch_async_impl(stream, cfg, args)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_cooperative(
-        self,
-        cfg: LaunchConfig,
-        args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), result::DriverError> {
-        self.launch_cooperative_async_impl(cfg, args)
+    ) -> Result<Option<(CudaEvent, CudaEvent)>, DriverError> {
+        self.stream.ctx.bind_to_thread()?;
+        for &event in self.waits.iter() {
+            self.stream.wait(event)?;
+        }
+        let start_event = self
+            .flags
+            .map(|flags| self.stream.record_event(Some(flags)))
+            .transpose()?;
+        result::launch_cooperative_kernel(
+            self.func.cu_function,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            self.stream.cu_stream,
+            &mut self.args,
+        )?;
+        let end_event = self
+            .flags
+            .map(|flags| self.stream.record_event(Some(flags)))
+            .transpose()?;
+        for &event in self.records.iter() {
+            event.record(self.stream)?;
+        }
+        Ok(start_event.zip(end_event))
     }
 }
-
-unsafe impl LaunchAsync<&mut Vec<*mut std::ffi::c_void>> for CudaFunction {
-    #[inline(always)]
-    unsafe fn launch(
-        self,
-        cfg: LaunchConfig,
-        args: &mut Vec<*mut std::ffi::c_void>,
-    ) -> Result<(), result::DriverError> {
-        self.launch_async_impl(cfg, args)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_on_stream(
-        self,
-        stream: &CudaStream,
-        cfg: LaunchConfig,
-        args: &mut Vec<*mut std::ffi::c_void>,
-    ) -> Result<(), result::DriverError> {
-        self.par_launch_async_impl(stream, cfg, args)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_cooperative(
-        self,
-        cfg: LaunchConfig,
-        args: &mut Vec<*mut std::ffi::c_void>,
-    ) -> Result<(), result::DriverError> {
-        self.launch_cooperative_async_impl(cfg, args)
-    }
-}
-
-macro_rules! impl_launch {
-    ([$($Vars:tt),*], [$($Idx:tt),*]) => {
-unsafe impl<$($Vars: DeviceRepr),*> LaunchAsync<($($Vars, )*)> for CudaFunction {
-    #[inline(always)]
-    unsafe fn launch(
-        self,
-        cfg: LaunchConfig,
-        args: ($($Vars, )*)
-    ) -> Result<(), result::DriverError> {
-        let params = &mut [$(args.$Idx.as_kernel_param(), )*];
-        self.launch_async_impl(cfg, params)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_cooperative(
-        self,
-        cfg: LaunchConfig,
-        args: ($($Vars, )*)
-    ) -> Result<(), result::DriverError> {
-        let params = &mut [$(args.$Idx.as_kernel_param(), )*];
-        self.launch_cooperative_async_impl(cfg, params)
-    }
-
-    #[inline(always)]
-    unsafe fn launch_on_stream(
-        self,
-        stream: &CudaStream,
-        cfg: LaunchConfig,
-        args: ($($Vars, )*)
-    ) -> Result<(), result::DriverError> {
-        let params = &mut [$(args.$Idx.as_kernel_param(), )*];
-        self.par_launch_async_impl(stream, cfg, params)
-    }
-}
-    };
-}
-
-impl_launch!([A], [0]);
-impl_launch!([A, B], [0, 1]);
-impl_launch!([A, B, C], [0, 1, 2]);
-impl_launch!([A, B, C, D], [0, 1, 2, 3]);
-impl_launch!([A, B, C, D, E], [0, 1, 2, 3, 4]);
-impl_launch!([A, B, C, D, E, F], [0, 1, 2, 3, 4, 5]);
-impl_launch!([A, B, C, D, E, F, G], [0, 1, 2, 3, 4, 5, 6]);
-impl_launch!([A, B, C, D, E, F, G, H], [0, 1, 2, 3, 4, 5, 6, 7]);
-impl_launch!([A, B, C, D, E, F, G, H, I], [0, 1, 2, 3, 4, 5, 6, 7, 8]);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25
-    ]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26
-    ]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27
-    ]
-);
-impl_launch!(
-    [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28
-    ]
-);
-impl_launch!(
-    [
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC,
-        AD
-    ],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29
-    ]
-);
-impl_launch!(
-    [
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC,
-        AD, AE
-    ],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30
-    ]
-);
-impl_launch!(
-    [
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC,
-        AD, AE, AF
-    ],
-    [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31
-    ]
-);
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use crate::{
-        driver::{DeviceSlice, DriverError},
+        driver::{CudaContext, DriverError},
         nvrtc::compile_ptx_with_opts,
     };
 
     use super::*;
 
     #[test]
-    fn test_mut_into_kernel_param_no_inc_rc() {
-        let device = CudaDevice::new(0).unwrap();
-        let t = device.htod_copy([0.0f32; 1].to_vec()).unwrap();
-        let _r = t.clone();
-        assert_eq!(Arc::strong_count(&device), 3);
-        let _ = (&t).as_kernel_param();
-        assert_eq!(Arc::strong_count(&device), 3);
-    }
+    fn test_launch_arrays() -> Result<(), DriverError> {
+        #[repr(C)]
+        struct TensorMeta {
+            num_dims: usize,
+            strides: [usize; 128],
+            shape: [usize; 128],
+        }
+        unsafe impl DeviceRepr for TensorMeta {}
 
-    #[test]
-    fn test_ref_into_kernel_param_inc_rc() {
-        let device = CudaDevice::new(0).unwrap();
-        let t = device.htod_copy([0.0f32; 1].to_vec()).unwrap();
-        let _r = t.clone();
-        assert_eq!(Arc::strong_count(&device), 3);
-        let _ = (&t).as_kernel_param();
-        assert_eq!(Arc::strong_count(&device), 3);
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+
+        let ptx = compile_ptx_with_opts(
+            "
+struct TensorMeta {
+    size_t num_dims;
+    size_t shape[128];
+    size_t strides[128];
+};
+
+extern \"C\" __global__ void kernel(const TensorMeta meta) {
+    for (int i = 0;i < meta.num_dims;i++) {
+        assert(meta.shape[i] == i);
+        assert(meta.strides[i] == i);
+    }
+}
+        ",
+            Default::default(),
+        )
+        .unwrap();
+
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("kernel").unwrap();
+
+        let meta = TensorMeta {
+            num_dims: 128,
+            shape: std::array::from_fn(|i| i),
+            strides: std::array::from_fn(|i| i),
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&f)
+                .arg(&meta)
+                .launch(LaunchConfig::for_num_elems(1))
+        }?;
+
+        stream.synchronize()?;
+
+        Ok(())
     }
 
     const SIN_CU: &str = "
@@ -509,27 +343,29 @@ extern \"C\" __global__ void sin_kernel(float *out, const float *inp, size_t num
 
     #[test]
     fn test_launch_with_mut_and_ref_cudarc() {
-        let ptx = compile_ptx_with_opts(SIN_CU, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "sin", &["sin_kernel"]).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
 
-        let sin_kernel = dev.get_func("sin", "sin_kernel").unwrap();
+        let ptx = compile_ptx_with_opts(SIN_CU, Default::default()).unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let sin_kernel = module.load_function("sin_kernel").unwrap();
 
         let a_host = [-1.0f32, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8];
 
-        let a_dev = dev.htod_copy(a_host.clone().to_vec()).unwrap();
-
+        let a_dev = stream.memcpy_stod(&a_host).unwrap();
         let mut b_dev = a_dev.clone();
 
         unsafe {
-            sin_kernel.launch(
-                LaunchConfig::for_num_elems(10),
-                (&mut b_dev, &a_dev, 10usize),
-            )
+            stream
+                .launch_builder(&sin_kernel)
+                .arg(&mut b_dev)
+                .arg(&a_dev)
+                .arg(&10usize)
+                .launch(LaunchConfig::for_num_elems(10))
         }
         .unwrap();
 
-        let b_host = dev.sync_reclaim(b_dev).unwrap();
+        let b_host = stream.memcpy_dtov(&b_dev).unwrap();
 
         for (a_i, b_i) in a_host.iter().zip(b_host.iter()) {
             let expected = a_i.sin();
@@ -541,21 +377,30 @@ extern \"C\" __global__ void sin_kernel(float *out, const float *inp, size_t num
 
     #[test]
     fn test_large_launches() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+
         let ptx = compile_ptx_with_opts(SIN_CU, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "sin", &["sin_kernel"]).unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let sin_kernel = module.load_function("sin_kernel").unwrap();
+
         for numel in [256, 512, 1024, 1280, 1536, 2048] {
             let mut a = Vec::with_capacity(numel);
             a.resize(numel, 1.0f32);
 
-            let a = dev.htod_copy(a).unwrap();
-            let mut b = dev.alloc_zeros::<f32>(numel).unwrap();
+            let a = stream.memcpy_stod(&a).unwrap();
+            let mut b = stream.alloc_zeros::<f32>(numel).unwrap();
+            unsafe {
+                stream
+                    .launch_builder(&sin_kernel)
+                    .arg(&mut b)
+                    .arg(&a)
+                    .arg(&numel)
+                    .launch(LaunchConfig::for_num_elems(numel as u32))
+            }
+            .unwrap();
 
-            let sin_kernel = dev.get_func("sin", "sin_kernel").unwrap();
-            let cfg = LaunchConfig::for_num_elems(numel as u32);
-            unsafe { sin_kernel.launch(cfg, (&mut b, &a, numel)) }.unwrap();
-
-            let b = dev.sync_reclaim(b).unwrap();
+            let b = stream.memcpy_dtov(&b).unwrap();
             for v in b {
                 assert_eq!(v, 0.841471);
             }
@@ -564,12 +409,15 @@ extern \"C\" __global__ void sin_kernel(float *out, const float *inp, size_t num
 
     #[test]
     fn test_launch_with_views() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+
         let ptx = compile_ptx_with_opts(SIN_CU, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "sin", &["sin_kernel"]).unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("sin_kernel").unwrap();
 
         let a_host = [-1.0f32, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8];
-        let a_dev = dev.htod_copy(a_host.clone().to_vec()).unwrap();
+        let a_dev = stream.memcpy_stod(&a_host).unwrap();
         let mut b_dev = a_dev.clone();
 
         for i in 0..5 {
@@ -577,12 +425,18 @@ extern \"C\" __global__ void sin_kernel(float *out, const float *inp, size_t num
             assert_eq!(a_sub.len, 10 - 2 * i);
             let mut b_sub = b_dev.try_slice_mut(i * 2..).unwrap();
             assert_eq!(b_sub.len, 10 - 2 * i);
-            let f = dev.get_func("sin", "sin_kernel").unwrap();
-            unsafe { f.launch(LaunchConfig::for_num_elems(2), (&mut b_sub, &a_sub, 2usize)) }
-                .unwrap();
+            unsafe {
+                stream
+                    .launch_builder(&f)
+                    .arg(&mut b_sub)
+                    .arg(&a_sub)
+                    .arg(&2usize)
+                    .launch(LaunchConfig::for_num_elems(2))
+            }
+            .unwrap();
         }
 
-        let b_host = dev.sync_reclaim(b_dev).unwrap();
+        let b_host = stream.memcpy_dtov(&b_dev).unwrap();
 
         for (a_i, b_i) in a_host.iter().zip(b_host.iter()) {
             let expected = a_i.sin();
@@ -629,83 +483,100 @@ extern \"C\" __global__ void floating(float f, double d) {
 
     #[test]
     fn test_launch_with_8bit() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let ptx = compile_ptx_with_opts(TEST_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["int_8bit"]).unwrap();
-        let f = dev.get_func("tests", "int_8bit").unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("int_8bit").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (i8::MIN, i8::MAX, u8::MIN, u8::MAX),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&i8::MIN)
+                .arg(&i8::MAX)
+                .arg(&u8::MIN)
+                .arg(&u8::MAX)
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     #[test]
     fn test_launch_with_16bit() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let ptx = compile_ptx_with_opts(TEST_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["int_16bit"]).unwrap();
-        let f = dev.get_func("tests", "int_16bit").unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("int_16bit").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (i16::MIN, i16::MAX, u16::MIN, u16::MAX),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&i16::MIN)
+                .arg(&i16::MAX)
+                .arg(&u16::MIN)
+                .arg(&u16::MAX)
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     #[test]
     fn test_launch_with_32bit() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let ptx = compile_ptx_with_opts(TEST_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["int_32bit"]).unwrap();
-        let f = dev.get_func("tests", "int_32bit").unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("int_32bit").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (i32::MIN, i32::MAX, u32::MIN, u32::MAX),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&i32::MIN)
+                .arg(&i32::MAX)
+                .arg(&u32::MIN)
+                .arg(&u32::MAX)
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     #[test]
     fn test_launch_with_64bit() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let ptx = compile_ptx_with_opts(TEST_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["int_64bit"]).unwrap();
-        let f = dev.get_func("tests", "int_64bit").unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("int_64bit").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (i64::MIN, i64::MAX, u64::MIN, u64::MAX),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&i64::MIN)
+                .arg(&i64::MAX)
+                .arg(&u64::MIN)
+                .arg(&u64::MAX)
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     #[test]
     fn test_launch_with_floats() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
         let ptx = compile_ptx_with_opts(TEST_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["floating"]).unwrap();
-        let f = dev.get_func("tests", "floating").unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("floating").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (1.2345678f32, -10.123456789876543f64),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&1.2345678f32)
+                .arg(&-10.123456789876543f64)
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     #[cfg(feature = "f16")]
@@ -731,17 +602,18 @@ extern \"C\" __global__ void halfs(__half h) {
             },
         )
         .unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["halfs"]).unwrap();
-        let f = dev.get_func("tests", "halfs").unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("halfs").unwrap();
         unsafe {
-            f.launch(
-                LaunchConfig::for_num_elems(1),
-                (half::f16::from_f32(1.234),),
-            )
+            stream
+                .launch_builder(&f)
+                .arg(&half::f16::from_f32(1.234))
+                .launch(LaunchConfig::for_num_elems(1))
         }
         .unwrap();
-        dev.synchronize().unwrap();
+        stream.synchronize().unwrap();
     }
 
     const SLOW_KERNELS: &str = "
@@ -757,43 +629,180 @@ extern \"C\" __global__ void slow_worker(const float *data, const size_t len, fl
     #[test]
     fn test_par_launch() -> Result<(), DriverError> {
         let ptx = compile_ptx_with_opts(SLOW_KERNELS, Default::default()).unwrap();
-        let dev = CudaDevice::new(0).unwrap();
-        dev.load_ptx(ptx, "tests", &["slow_worker"]).unwrap();
-        let slice = dev.alloc_zeros::<f32>(1000)?;
-        let mut a = dev.alloc_zeros::<f32>(1)?;
-        let mut b = dev.alloc_zeros::<f32>(1)?;
+        let ctx = CudaContext::new(0)?;
+        let module = ctx.load_module(ptx).unwrap();
+        let f = module.load_function("slow_worker").unwrap();
+
+        let stream = ctx.new_stream()?;
+        let slice = stream.alloc_zeros::<f32>(1000)?;
+        let mut a = stream.alloc_zeros::<f32>(1)?;
+        let mut b = stream.alloc_zeros::<f32>(1)?;
+        stream.synchronize()?;
+
         let cfg = LaunchConfig::for_num_elems(1);
 
-        let start = Instant::now();
-        {
+        let double_launch_ms = {
             // launch two kernels on the default stream
-            let f = dev.get_func("tests", "slow_worker").unwrap();
-            unsafe { f.launch(cfg, (&slice, slice.len(), &mut a))? };
-            let f = dev.get_func("tests", "slow_worker").unwrap();
-            unsafe { f.launch(cfg, (&slice, slice.len(), &mut b))? };
-            dev.synchronize()?;
-        }
-        let double_launch_s = start.elapsed().as_secs_f64();
+            let start = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            unsafe {
+                stream
+                    .launch_builder(&f)
+                    .arg(&slice)
+                    .arg(&slice.len())
+                    .arg(&mut a)
+                    .launch(cfg)?
+            };
+            unsafe {
+                stream
+                    .launch_builder(&f)
+                    .arg(&slice)
+                    .arg(&slice.len())
+                    .arg(&mut b)
+                    .launch(cfg)?
+            };
+            let end = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            stream.synchronize()?;
+            start.elapsed_ms(&end)?
+        };
 
-        let start = Instant::now();
-        {
+        let stream2 = stream.fork()?;
+        let par_launch_ms = {
             // create a new stream & launch them concurrently
-            let stream = dev.fork_default_stream()?;
-            let f = dev.get_func("tests", "slow_worker").unwrap();
-            unsafe { f.launch(cfg, (&slice, slice.len(), &mut a))? };
-            let f = dev.get_func("tests", "slow_worker").unwrap();
-            unsafe { f.launch_on_stream(&stream, cfg, (&slice, slice.len(), &mut b))? };
-            dev.wait_for(&stream)?;
-            dev.synchronize()?;
-        }
-        let par_launch_s = start.elapsed().as_secs_f64();
+            let start = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            unsafe {
+                stream
+                    .launch_builder(&f)
+                    .arg(&slice)
+                    .arg(&slice.len())
+                    .arg(&mut a)
+                    .launch(cfg)?
+            };
+            unsafe {
+                stream2
+                    .launch_builder(&f)
+                    .arg(&slice)
+                    .arg(&slice.len())
+                    .arg(&mut b)
+                    .launch(cfg)?
+            };
+            stream.join(&stream2)?;
+            let end = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            stream.synchronize()?;
+            start.elapsed_ms(&end)?
+        };
 
         assert!(
-            (double_launch_s - 2.0 * par_launch_s).abs() < 20.0 / 100.0,
-            "par={:?} dbl={:?}",
-            par_launch_s,
-            double_launch_s
+            (double_launch_ms - 2.0 * par_launch_ms).abs() < 0.2 * double_launch_ms,
+            "par={par_launch_ms:?} dbl={double_launch_ms:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_stream_concurrent_reads() -> Result<(), DriverError> {
+        let ptx = compile_ptx_with_opts(SLOW_KERNELS, Default::default()).unwrap();
+        let ctx = CudaContext::new(0)?;
+        let module = ctx.load_module(ptx)?;
+        let f = module.load_function("slow_worker")?;
+
+        let stream1 = ctx.new_stream()?;
+
+        let src = stream1.alloc_zeros::<f32>(1000)?;
+        let numel = src.len();
+        let mut dst1 = stream1.alloc_zeros::<f32>(1)?;
+        let mut dst2 = stream1.alloc_zeros::<f32>(1)?;
+
+        let stream2 = stream1.fork()?;
+
+        let cfg = LaunchConfig::for_num_elems(1);
+
+        let mut builder = stream1.launch_builder(&f);
+        builder
+            .arg(&src)
+            .arg(&numel)
+            .arg(&mut dst1)
+            .record_kernel_launch(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let (_, stream1_finish) = unsafe { builder.launch(cfg) }?.unwrap();
+
+        let mut builder = stream2.launch_builder(&f);
+        builder
+            .arg(&src)
+            .arg(&numel)
+            .arg(&mut dst2)
+            .record_kernel_launch(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let (stream2_start, _) = unsafe { builder.launch(cfg) }?.unwrap();
+
+        stream1.synchronize()?;
+        stream2.synchronize()?;
+
+        assert!(stream2_start.elapsed_ms(&stream1_finish)? >= 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_stream_writes_block() -> Result<(), DriverError> {
+        let ptx = compile_ptx_with_opts(SLOW_KERNELS, Default::default()).unwrap();
+        let ctx = CudaContext::new(0)?;
+        let module = ctx.load_module(ptx)?;
+        let f = module.load_function("slow_worker")?;
+
+        let stream1 = ctx.new_stream()?;
+
+        let src = stream1.alloc_zeros::<f32>(1000)?;
+        let numel = src.len();
+        let mut dst = stream1.alloc_zeros::<f32>(1)?;
+        let cfg = LaunchConfig::for_num_elems(1);
+
+        let stream2 = stream1.fork()?;
+
+        let mut builder = stream1.launch_builder(&f);
+        builder
+            .arg(&src)
+            .arg(&numel)
+            .arg(&mut dst)
+            .record_kernel_launch(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let (_, stream1_finish) = unsafe { builder.launch(cfg) }?.unwrap();
+
+        let mut builder = stream2.launch_builder(&f);
+        builder
+            .arg(&src)
+            .arg(&numel)
+            .arg(&mut dst)
+            .record_kernel_launch(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let (stream2_start, _) = unsafe { builder.launch(cfg) }?.unwrap();
+
+        stream1.synchronize()?;
+        stream2.synchronize()?;
+
+        assert!(stream1_finish.elapsed_ms(&stream2_start)? >= 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "must be executed by itself"]
+    fn test_device_side_assert() -> Result<(), DriverError> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
+        let inp = stream.memcpy_stod(&[1.0f32; 100])?;
+        let mut out = stream.alloc_zeros::<f32>(100)?;
+        let ptx = crate::nvrtc::compile_ptx(
+            "
+    extern \"C\" __global__ void foo(float *out, const float *inp, const size_t numel) {
+        assert(0);
+    }",
+        )
+        .unwrap();
+        let module = ctx.load_module(ptx)?;
+        let foo = module.load_function("foo")?;
+        let mut builder = stream.launch_builder(&foo);
+        builder.arg(&mut out);
+        builder.arg(&inp);
+        builder.arg(&100usize);
+        unsafe { builder.launch(LaunchConfig::for_num_elems(100)) }?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        stream
+            .synchronize()
+            .expect_err("Should've had device side assert");
         Ok(())
     }
 }

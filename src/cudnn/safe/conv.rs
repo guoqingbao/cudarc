@@ -276,29 +276,28 @@ impl<X: CudnnDataType, C: CudnnDataType, Y: CudnnDataType> ConvForward<'_, X, C,
         Filter: DevicePtr<X>,
         Dst: DevicePtrMut<Y>,
     {
-        let (num_bytes, workspace_ptr) = match workspace {
-            Some(w) => (
-                w.num_bytes(),
-                *w.device_ptr_mut() as *mut u8 as *mut std::ffi::c_void,
-            ),
-            None => (0, std::ptr::null_mut()),
-        };
+        let stream = &self.x.handle.stream;
         let alpha = alpha.into_scaling_parameter();
         let beta = beta.into_scaling_parameter();
+        let (src, _record_src) = src.device_ptr(stream);
+        let (filter, _record_f) = filter.device_ptr(stream);
+        let (y, _record_y) = y.device_ptr_mut(stream);
+        let workspace_size_in_bytes = workspace.as_ref().map(|w| w.num_bytes()).unwrap_or(0);
+        let (w, _record_w) = workspace.map(|w| w.device_ptr_mut(stream)).unzip();
         result::convolution_forward(
             self.conv.handle.handle,
             (&alpha) as *const Y::Scalar as *const std::ffi::c_void,
             self.x.desc,
-            *src.device_ptr() as *const X as *const std::ffi::c_void,
+            src as *const X as *const std::ffi::c_void,
             self.w.desc,
-            *filter.device_ptr() as *const X as *const std::ffi::c_void,
+            filter as *const X as *const std::ffi::c_void,
             self.conv.desc,
             algo,
-            workspace_ptr,
-            num_bytes,
+            w.map(|ptr| ptr as _).unwrap_or(std::ptr::null_mut()),
+            workspace_size_in_bytes,
             (&beta) as *const Y::Scalar as *const std::ffi::c_void,
             self.y.desc,
-            *y.device_ptr_mut() as *mut Y as *mut std::ffi::c_void,
+            y as *mut Y as *mut std::ffi::c_void,
         )
     }
 }
@@ -390,29 +389,28 @@ impl<X: CudnnDataType, C: CudnnDataType, Y: CudnnDataType> ConvBackwardData<'_, 
         Filter: DevicePtr<X>,
         Dst: DevicePtr<Y>,
     {
-        let (num_bytes, workspace_ptr) = match workspace {
-            Some(w) => (
-                w.num_bytes(),
-                *w.device_ptr_mut() as *mut u8 as *mut std::ffi::c_void,
-            ),
-            None => (0, std::ptr::null_mut()),
-        };
+        let stream = &self.dx.handle.stream;
         let alpha = alpha.into_scaling_parameter();
         let beta = beta.into_scaling_parameter();
+        let (dx, _record_dx) = dx.device_ptr_mut(stream);
+        let (filter, _record_f) = filter.device_ptr(stream);
+        let (dy, _record_dy) = dy.device_ptr(stream);
+        let workspace_size_in_bytes = workspace.as_ref().map(|w| w.num_bytes()).unwrap_or(0);
+        let (w, _record_w) = workspace.map(|w| w.device_ptr_mut(stream)).unzip();
         result::convolution_backward_data(
             self.conv.handle.handle,
             (&alpha) as *const Y::Scalar as *const std::ffi::c_void,
             self.w.desc,
-            *filter.device_ptr() as *const X as *const std::ffi::c_void,
+            filter as *const X as *const std::ffi::c_void,
             self.dy.desc,
-            *dy.device_ptr() as *const Y as *const std::ffi::c_void,
+            dy as *const Y as *const std::ffi::c_void,
             self.conv.desc,
             algo,
-            workspace_ptr,
-            num_bytes,
+            w.map(|ptr| ptr as _).unwrap_or(std::ptr::null_mut()),
+            workspace_size_in_bytes,
             (&beta) as *const Y::Scalar as *const std::ffi::c_void,
             self.dx.desc,
-            *dx.device_ptr_mut() as *mut X as *mut std::ffi::c_void,
+            dx as *mut X as *mut std::ffi::c_void,
         )
     }
 }
@@ -504,25 +502,28 @@ impl<X: CudnnDataType, C: CudnnDataType, Y: CudnnDataType> ConvBackwardFilter<'_
         Filter: DevicePtrMut<X>,
         Dst: DevicePtr<Y>,
     {
-        let (num_bytes, workspace_ptr) = workspace
-            .map(|x| (x.num_bytes(), *x.device_ptr_mut() as *mut std::ffi::c_void))
-            .unwrap_or((0, std::ptr::null_mut()));
+        let stream = &self.x.handle.stream;
         let alpha = alpha.into_scaling_parameter();
         let beta = beta.into_scaling_parameter();
+        let (x, _record_x) = x.device_ptr(stream);
+        let (dfilter, _record_f) = dfilter.device_ptr_mut(stream);
+        let (dy, _record_dy) = dy.device_ptr(stream);
+        let workspace_size_in_bytes = workspace.as_ref().map(|w| w.num_bytes()).unwrap_or(0);
+        let (w, _record_w) = workspace.map(|w| w.device_ptr_mut(stream)).unzip();
         result::convolution_backward_filter(
             self.conv.handle.handle,
             (&alpha) as *const Y::Scalar as *const std::ffi::c_void,
             self.x.desc,
-            *x.device_ptr() as *const _,
+            x as *const _,
             self.dy.desc,
-            *dy.device_ptr() as *const _,
+            dy as *const _,
             self.conv.desc,
             algo,
-            workspace_ptr,
-            num_bytes,
+            w.map(|ptr| ptr as _).unwrap_or(std::ptr::null_mut()),
+            workspace_size_in_bytes,
             (&beta) as *const Y::Scalar as *const std::ffi::c_void,
             self.dw.desc,
-            *dfilter.device_ptr_mut() as *mut _,
+            dfilter as *mut _,
         )
     }
 }
@@ -616,34 +617,35 @@ where
         Filter: DevicePtr<X>,
         Dst: DevicePtrMut<Y>,
     {
-        let (num_bytes, workspace_ptr) = match workspace {
-            Some(w) => (
-                w.num_bytes(),
-                *w.device_ptr_mut() as *mut u8 as *mut std::ffi::c_void,
-            ),
-            None => (0, std::ptr::null_mut()),
-        };
         let alpha1 = alpha1.into_scaling_parameter();
         let alpha2 = alpha2.into_scaling_parameter();
+        let stream = &self.x.handle.stream;
+        let (src, _record_src) = src.device_ptr(stream);
+        let (filter, _record_f) = filter.device_ptr(stream);
+        let (z, _record_z) = z.device_ptr(stream);
+        let (bias, _record_bias) = bias.device_ptr(stream);
+        let (y, _record_y) = y.device_ptr_mut(stream);
+        let workspace_size_in_bytes = workspace.as_ref().map(|w| w.num_bytes()).unwrap_or(0);
+        let (w, _record_w) = workspace.map(|w| w.device_ptr_mut(stream)).unzip();
         result::convolution_bias_activation_forward(
             self.conv.handle.handle,
             (&alpha1) as *const Y::Scalar as *const std::ffi::c_void,
             self.x.desc,
-            *src.device_ptr() as *const X as *const std::ffi::c_void,
+            src as *const X as *const std::ffi::c_void,
             self.w.desc,
-            *filter.device_ptr() as *const X as *const std::ffi::c_void,
+            filter as *const X as *const std::ffi::c_void,
             self.conv.desc,
             algo,
-            workspace_ptr,
-            num_bytes,
+            w.map(|ptr| ptr as _).unwrap_or(std::ptr::null_mut()),
+            workspace_size_in_bytes,
             (&alpha2) as *const Y::Scalar as *const std::ffi::c_void,
             self.z.desc,
-            *z.device_ptr() as *const X as *const std::ffi::c_void,
+            z as *const X as *const std::ffi::c_void,
             self.bias.desc,
-            *bias.device_ptr() as *const X as *const std::ffi::c_void,
+            bias as *const X as *const std::ffi::c_void,
             self.act.desc,
             self.y.desc,
-            *y.device_ptr_mut() as *mut Y as *mut std::ffi::c_void,
+            y as *mut Y as *mut std::ffi::c_void,
         )
     }
 }

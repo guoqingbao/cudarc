@@ -1,23 +1,25 @@
 //! Safe abstractions around [crate::curand::result] with [CudaRng].
 
 use super::{result, sys};
-use crate::driver::{CudaDevice, DevicePtrMut};
+use crate::driver::{CudaStream, DevicePtrMut};
 use std::sync::Arc;
 
-/// Host side RNG that can fill [CudaSlice] with random values.
+/// Host side RNG that can fill [crate::driver::CudaSlice]/[crate::driver::CudaViewMut] with random values.
 ///
 /// 1. Create:
 /// ```rust
 /// # use cudarc::{driver::*, curand::*};
-/// let device = CudaDevice::new(0).unwrap();
-/// let rng = CudaRng::new(0, device).unwrap();
+/// let ctx = CudaContext::new(0).unwrap();
+/// let stream = ctx.default_stream();
+/// let rng = CudaRng::new(0, stream.clone()).unwrap();
 /// ```
 /// 2. Fill device memory:
 /// ```rust
 /// # use cudarc::{driver::*, curand::*};
-/// # let device = CudaDevice::new(0).unwrap();
-/// # let rng = CudaRng::new(0, device.clone()).unwrap();
-/// let mut a_dev = device.alloc_zeros::<f32>(10).unwrap();
+/// # let ctx = CudaContext::new(0).unwrap();
+/// # let stream = ctx.default_stream();
+/// # let rng = CudaRng::new(0, stream.clone()).unwrap();
+/// let mut a_dev = stream.alloc_zeros::<f32>(10).unwrap();
 /// rng.fill_with_uniform(&mut a_dev).unwrap();
 /// ```
 ///
@@ -27,18 +29,29 @@ use std::sync::Arc;
 /// 3. LogNormal - [CudaRng::fill_with_log_normal()]
 pub struct CudaRng {
     pub(crate) gen: sys::curandGenerator_t,
-    pub(crate) device: Arc<CudaDevice>,
+    pub(crate) stream: Arc<CudaStream>,
 }
 
 impl CudaRng {
-    /// Constructs the RNG with the given `seed`. Requires the stream from [CudaDevice] to submit kernels.
-    pub fn new(seed: u64, device: Arc<CudaDevice>) -> Result<Self, result::CurandError> {
-        device.bind_to_thread().unwrap();
+    /// Constructs the RNG with the given `seed`. All calls run on `stream`.
+    pub fn new(seed: u64, stream: Arc<CudaStream>) -> Result<Self, result::CurandError> {
+        let ctx = &stream.ctx;
+        ctx.record_err(ctx.bind_to_thread());
         let gen = result::create_generator()?;
-        let mut rng = Self { gen, device };
+        unsafe { result::set_stream(gen, stream.cu_stream as _) }?;
+        let mut rng = Self { gen, stream };
         rng.set_seed(seed)?;
-        unsafe { result::set_stream(rng.gen, rng.device.stream as *mut _) }?;
         Ok(rng)
+    }
+
+    /// # Safety
+    /// Users must ensure this stream is properly synchronized
+    pub unsafe fn set_stream(
+        &mut self,
+        stream: Arc<CudaStream>,
+    ) -> Result<(), result::CurandError> {
+        self.stream = stream;
+        result::set_stream(self.gen, self.stream.cu_stream as _)
     }
 
     /// Re-seed the RNG.
@@ -50,7 +63,7 @@ impl CudaRng {
         unsafe { result::set_offset(self.gen, offset) }
     }
 
-    /// Fill the [CudaSlice] with data from a `Uniform` distribution
+    /// Fill the [crate::driver::CudaSlice]/[crate::driver::CudaViewMut] with data from a `Uniform` distribution
     pub fn fill_with_uniform<T, Dst: DevicePtrMut<T>>(
         &self,
         dst: &mut Dst,
@@ -58,10 +71,12 @@ impl CudaRng {
     where
         sys::curandGenerator_t: result::UniformFill<T>,
     {
-        unsafe { result::UniformFill::fill(self.gen, *dst.device_ptr_mut() as *mut T, dst.len()) }
+        let num = dst.len();
+        let (dst, _record_dst) = dst.device_ptr_mut(&self.stream);
+        unsafe { result::UniformFill::fill(self.gen, dst as *mut T, num) }
     }
 
-    /// Fill the [CudaSlice] with data from a `Normal(mean, std)` distribution.
+    /// Fill the [crate::driver::CudaSlice]/[crate::driver::CudaViewMut] with data from a `Normal(mean, std)` distribution.
     pub fn fill_with_normal<T, Dst: DevicePtrMut<T>>(
         &self,
         dst: &mut Dst,
@@ -71,18 +86,12 @@ impl CudaRng {
     where
         sys::curandGenerator_t: result::NormalFill<T>,
     {
-        unsafe {
-            result::NormalFill::fill(
-                self.gen,
-                *dst.device_ptr_mut() as *mut T,
-                dst.len(),
-                mean,
-                std,
-            )
-        }
+        let num = dst.len();
+        let (dst, _record_dst) = dst.device_ptr_mut(&self.stream);
+        unsafe { result::NormalFill::fill(self.gen, dst as *mut T, num, mean, std) }
     }
 
-    /// Fill the `CudaRc` with data from a `LogNormal(mean, std)` distribution.
+    /// Fill the [crate::driver::CudaSlice]/[crate::driver::CudaViewMut] with data from a `LogNormal(mean, std)` distribution.
     pub fn fill_with_log_normal<T, Dst: DevicePtrMut<T>>(
         &self,
         dst: &mut Dst,
@@ -92,15 +101,9 @@ impl CudaRng {
     where
         sys::curandGenerator_t: result::LogNormalFill<T>,
     {
-        unsafe {
-            result::LogNormalFill::fill(
-                self.gen,
-                *dst.device_ptr_mut() as *mut T,
-                dst.len(),
-                mean,
-                std,
-            )
-        }
+        let num = dst.len();
+        let (dst, _record_dst) = dst.device_ptr_mut(&self.stream);
+        unsafe { result::LogNormalFill::fill(self.gen, dst as *mut T, num, mean, std) }
     }
 }
 
@@ -131,11 +134,12 @@ mod tests {
     where
         super::sys::curandGenerator_t: UniformFill<T>,
     {
-        let dev = CudaDevice::new(0).unwrap();
-        let mut a_dev = dev.alloc_zeros::<T>(n).unwrap();
-        let rng = CudaRng::new(seed, dev.clone()).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut a_dev = stream.alloc_zeros::<T>(n).unwrap();
+        let rng = CudaRng::new(seed, stream.clone()).unwrap();
         rng.fill_with_uniform(&mut a_dev).unwrap();
-        dev.sync_reclaim(a_dev).unwrap()
+        stream.memcpy_dtov(&a_dev).unwrap()
     }
 
     fn gen_normal<T: ValidAsZeroBits + Clone + Default + Unpin + DeviceRepr>(
@@ -147,11 +151,12 @@ mod tests {
     where
         super::sys::curandGenerator_t: NormalFill<T>,
     {
-        let dev = CudaDevice::new(0).unwrap();
-        let mut a_dev = dev.alloc_zeros::<T>(n).unwrap();
-        let rng = CudaRng::new(seed, dev.clone()).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut a_dev = stream.alloc_zeros::<T>(n).unwrap();
+        let rng = CudaRng::new(seed, stream.clone()).unwrap();
         rng.fill_with_normal(&mut a_dev, mean, std).unwrap();
-        dev.sync_reclaim(a_dev).unwrap()
+        stream.memcpy_dtov(&a_dev).unwrap()
     }
 
     fn gen_log_normal<T: ValidAsZeroBits + Clone + Default + Unpin + DeviceRepr>(
@@ -163,79 +168,69 @@ mod tests {
     where
         super::sys::curandGenerator_t: LogNormalFill<T>,
     {
-        let dev = CudaDevice::new(0).unwrap();
-        let mut a_dev = dev.alloc_zeros::<T>(n).unwrap();
-        let rng = CudaRng::new(seed, dev.clone()).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut a_dev = stream.alloc_zeros::<T>(n).unwrap();
+        let rng = CudaRng::new(seed, stream.clone()).unwrap();
         rng.fill_with_log_normal(&mut a_dev, mean, std).unwrap();
-        dev.sync_reclaim(a_dev).unwrap()
-    }
-
-    #[test]
-    fn test_rc_counts() {
-        let dev = CudaDevice::new(0).unwrap();
-        assert_eq!(Arc::strong_count(&dev), 1);
-        let a_rng = CudaRng::new(0, dev.clone()).unwrap();
-        assert_eq!(Arc::strong_count(&dev), 2);
-        let a_dev = dev.alloc_zeros::<f32>(10).unwrap();
-        assert_eq!(Arc::strong_count(&dev), 3);
-        drop(a_rng);
-        assert_eq!(Arc::strong_count(&dev), 2);
-        drop(a_dev);
-        assert_eq!(Arc::strong_count(&dev), 1);
+        stream.memcpy_dtov(&a_dev).unwrap()
     }
 
     #[test]
     fn test_seed_reproducible() {
-        let dev = CudaDevice::new(0).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
 
-        let mut a_dev = dev.alloc_zeros::<f32>(10).unwrap();
+        let mut a_dev = stream.alloc_zeros::<f32>(10).unwrap();
         let mut b_dev = a_dev.clone();
 
-        let a_rng = CudaRng::new(0, dev.clone()).unwrap();
-        let b_rng = CudaRng::new(0, dev.clone()).unwrap();
+        let a_rng = CudaRng::new(0, stream.clone()).unwrap();
+        let b_rng = CudaRng::new(0, stream.clone()).unwrap();
 
         a_rng.fill_with_uniform(&mut a_dev).unwrap();
         b_rng.fill_with_uniform(&mut b_dev).unwrap();
 
-        let a_host = dev.sync_reclaim(a_dev).unwrap();
-        let b_host = dev.sync_reclaim(b_dev).unwrap();
+        let a_host = stream.memcpy_dtov(&a_dev).unwrap();
+        let b_host = stream.memcpy_dtov(&b_dev).unwrap();
         assert_eq!(a_host, b_host);
     }
 
     #[test]
     fn test_different_seeds_neq() {
-        let dev = CudaDevice::new(0).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
 
-        let mut a_dev = dev.alloc_zeros::<f32>(10).unwrap();
+        let mut a_dev = stream.alloc_zeros::<f32>(10).unwrap();
         let mut b_dev = a_dev.clone();
 
-        let a_rng = CudaRng::new(0, dev.clone()).unwrap();
-        let b_rng = CudaRng::new(1, dev.clone()).unwrap();
+        let a_rng = CudaRng::new(0, stream.clone()).unwrap();
+        let b_rng = CudaRng::new(1, stream.clone()).unwrap();
 
         a_rng.fill_with_uniform(&mut a_dev).unwrap();
         b_rng.fill_with_uniform(&mut b_dev).unwrap();
 
-        let a_host = dev.sync_reclaim(a_dev).unwrap();
-        let b_host = dev.sync_reclaim(b_dev).unwrap();
+        let a_host = stream.memcpy_dtov(&a_dev).unwrap();
+        let b_host = stream.memcpy_dtov(&b_dev).unwrap();
         assert_ne!(a_host, b_host);
     }
 
     #[test]
     fn test_set_offset() {
-        let dev = CudaDevice::new(0).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
 
-        let mut a_dev = dev.alloc_zeros::<f32>(10).unwrap();
-        let mut a_rng = CudaRng::new(0, dev.clone()).unwrap();
-
-        a_rng.set_seed(42).unwrap();
-        a_rng.set_offset(0).unwrap();
-        a_rng.fill_with_uniform(&mut a_dev).unwrap();
-        let a_host = dev.sync_reclaim(a_dev.clone()).unwrap();
+        let mut a_dev = stream.alloc_zeros::<f32>(10).unwrap();
+        let mut a_rng = CudaRng::new(0, stream.clone()).unwrap();
 
         a_rng.set_seed(42).unwrap();
         a_rng.set_offset(0).unwrap();
         a_rng.fill_with_uniform(&mut a_dev).unwrap();
-        let b_host = dev.sync_reclaim(a_dev).unwrap();
+        let a_host = stream.memcpy_dtov(&a_dev).unwrap();
+
+        a_rng.set_seed(42).unwrap();
+        a_rng.set_offset(0).unwrap();
+        a_rng.fill_with_uniform(&mut a_dev).unwrap();
+        let b_host = stream.memcpy_dtov(&a_dev).unwrap();
 
         assert_eq!(a_host, b_host);
     }

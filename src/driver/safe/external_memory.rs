@@ -1,12 +1,52 @@
-use core::mem::ManuallyDrop;
 use std::fs::File;
+use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{CudaDevice, DevicePtr, DeviceSlice};
+use super::{CudaContext, CudaEvent, CudaStream, DevicePtr, DeviceSlice, SyncOnDrop};
 use crate::driver::{result, sys, DriverError};
 
-impl CudaDevice {
+/// An abstraction for imported external memory.
+///
+/// This struct can be created via [`CudaContext::import_external_memory()`].
+/// The imported external memory will be destroyed when this struct is dropped.
+#[derive(Debug)]
+pub struct ExternalMemory {
+    external_memory: sys::CUexternalMemory,
+    size: u64,
+    ctx: Arc<CudaContext>,
+    _file: ManuallyDrop<File>,
+}
+
+impl Drop for ExternalMemory {
+    fn drop(&mut self) {
+        let ctx = &self.ctx;
+        ctx.record_err(ctx.bind_to_thread());
+
+        ctx.record_err(unsafe {
+            result::external_memory::destroy_external_memory(self.external_memory)
+        });
+
+        // From [CUDA docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html#group__CUDA__EXTRES__INTEROP_1g52aba3a7f780157d8ba12972b2481735),
+        // when successfully importing UNIX file descriptor:
+        //
+        // > Ownership of the file descriptor is transferred to the CUDA driver when the handle is imported successfully.
+        // > Performing any operations on the file descriptor after it is imported results in undefined behavior.
+        //
+        // On the other hand, on Windows:
+        //
+        // > Ownership of this handle is not transferred to CUDA after the import operation,
+        // > so the application must release the handle using the appropriate system call.
+        //
+        // Therefore, we manually drop the file when we are on Windows.
+        #[cfg(windows)]
+        unsafe {
+            ManuallyDrop::<File>::drop(&mut self._file)
+        };
+    }
+}
+
+impl CudaContext {
     /// Import external memory from a [`File`].
     ///
     /// # Safety
@@ -32,46 +72,9 @@ impl CudaDevice {
         Ok(ExternalMemory {
             external_memory,
             size,
-            device: self.clone(),
+            ctx: self.clone(),
             _file: ManuallyDrop::new(file),
         })
-    }
-}
-
-/// An abstraction for imported external memory.
-///
-/// This struct can be created via [`CudaDevice::import_external_memory`].
-/// The imported external memory will be destroyed when this struct is dropped.
-#[derive(Debug)]
-pub struct ExternalMemory {
-    external_memory: sys::CUexternalMemory,
-    size: u64,
-    device: Arc<CudaDevice>,
-    _file: ManuallyDrop<File>,
-}
-
-impl Drop for ExternalMemory {
-    fn drop(&mut self) {
-        self.device.bind_to_thread().unwrap();
-
-        unsafe { result::external_memory::destroy_external_memory(self.external_memory) }.unwrap();
-
-        // From [CUDA docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html#group__CUDA__EXTRES__INTEROP_1g52aba3a7f780157d8ba12972b2481735),
-        // when successfully importing UNIX file descriptor:
-        //
-        // > Ownership of the file descriptor is transferred to the CUDA driver when the handle is imported successfully.
-        // > Performing any operations on the file descriptor after it is imported results in undefined behavior.
-        //
-        // On the other hand, on Windows:
-        //
-        // > Ownership of this handle is not transferred to CUDA after the import operation,
-        // > so the application must release the handle using the appropriate system call.
-        //
-        // Therefore, we manually drop the file when we are on Windows.
-        #[cfg(windows)]
-        unsafe {
-            ManuallyDrop::<File>::drop(&mut self._file)
-        };
     }
 }
 
@@ -101,10 +104,14 @@ impl ExternalMemory {
                 range.len() as u64,
             )
         }?;
+        let event = self.ctx.new_event(None)?;
+        let stream = self.ctx.default_stream();
         Ok(MappedBuffer {
             device_ptr,
             len: range.len(),
             external_memory: self,
+            event,
+            stream,
         })
     }
 }
@@ -118,12 +125,16 @@ pub struct MappedBuffer {
     device_ptr: sys::CUdeviceptr,
     len: usize,
     external_memory: ExternalMemory,
+    event: CudaEvent,
+    stream: Arc<CudaStream>,
 }
 
 impl Drop for MappedBuffer {
     fn drop(&mut self) {
-        self.external_memory.device.bind_to_thread().unwrap();
-        unsafe { result::memory_free(self.device_ptr) }.unwrap()
+        let ctx = &self.external_memory.ctx;
+        ctx.record_err(ctx.bind_to_thread());
+        ctx.record_err(self.stream.wait(&self.event));
+        ctx.record_err(unsafe { result::memory_free(self.device_ptr) })
     }
 }
 
@@ -131,10 +142,20 @@ impl DeviceSlice<u8> for MappedBuffer {
     fn len(&self) -> usize {
         self.len
     }
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 }
 
 impl DevicePtr<u8> for MappedBuffer {
-    fn device_ptr(&self) -> &sys::CUdeviceptr {
-        &self.device_ptr
+    fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        // Since we only implement [DevicePtr] for this, and not [DevicePtrMut],
+        // this memory can never be written to, only read from. So we don't need
+        // to synchronize here at all.
+        // However, we still do need to record this read.
+        (
+            self.device_ptr,
+            SyncOnDrop::Record(Some((&self.event, stream))),
+        )
     }
 }

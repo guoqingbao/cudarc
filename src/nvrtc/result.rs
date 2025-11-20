@@ -1,6 +1,6 @@
 //! A thin wrapper around [sys] providing [Result]s with [NvrtcError].
 
-use super::sys::{self, lib};
+use super::sys::{self};
 use core::{
     ffi::{c_char, c_int, CStr},
     mem::MaybeUninit,
@@ -39,22 +39,24 @@ impl std::error::Error for NvrtcError {}
 /// Example:
 /// ```rust
 /// # use cudarc::nvrtc::result::*;
-/// let prog = create_program("extern \"C\" __global__ void kernel() { }").unwrap();
+/// let prog = create_program(c"extern \"C\" __global__ void kernel() { }", None).unwrap();
 /// ```
-pub fn create_program<S: AsRef<str>>(src: S) -> Result<sys::nvrtcProgram, NvrtcError> {
-    let src_c = CString::new(src.as_ref()).unwrap();
+///
+/// Note that the returned `nvrtcProgram` may contain
+/// references to `src` and `name`. The memory containing the compiled
+/// code and name must not be dropped until the `nvrtcProgram` is destroyed.
+pub fn create_program(src: &CStr, name: Option<&CStr>) -> Result<sys::nvrtcProgram, NvrtcError> {
     let mut prog = MaybeUninit::uninit();
     unsafe {
-        lib()
-            .nvrtcCreateProgram(
-                prog.as_mut_ptr(),
-                src_c.as_c_str().as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-            .result()?;
+        sys::nvrtcCreateProgram(
+            prog.as_mut_ptr(),
+            src.as_ptr(),
+            name.map(|n| n.as_ptr()).unwrap_or(std::ptr::null()),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+        .result()?;
         Ok(prog.assume_init())
     }
 }
@@ -68,7 +70,7 @@ pub fn create_program<S: AsRef<str>>(src: S) -> Result<sys::nvrtcProgram, NvrtcE
 ///
 /// ```rust
 /// # use cudarc::nvrtc::result::*;
-/// let prog = create_program("extern \"C\" __global__ void kernel() { }").unwrap();
+/// let prog = create_program(c"extern \"C\" __global__ void kernel() { }", None).unwrap();
 /// unsafe { compile_program(prog, &["--ftz=true", "--fmad=true"]) }.unwrap();
 /// ```
 ///
@@ -86,9 +88,7 @@ pub unsafe fn compile_program<O: Clone + Into<Vec<u8>>>(
         .collect();
     let c_strs: Vec<&CStr> = c_strings.iter().map(CString::as_c_str).collect();
     let opts: Vec<*const c_char> = c_strs.iter().cloned().map(CStr::as_ptr).collect();
-    lib()
-        .nvrtcCompileProgram(prog, opts.len() as c_int, opts.as_ptr())
-        .result()
+    sys::nvrtcCompileProgram(prog, opts.len() as c_int, opts.as_ptr()).result()
 }
 
 /// Releases resources associated with `prog`.
@@ -99,9 +99,7 @@ pub unsafe fn compile_program<O: Clone + Into<Vec<u8>>>(
 ///
 /// `prog` must be created from [create_program()] and not have been freed by [destroy_program()].
 pub unsafe fn destroy_program(prog: sys::nvrtcProgram) -> Result<(), NvrtcError> {
-    lib()
-        .nvrtcDestroyProgram(&prog as *const _ as *mut _)
-        .result()
+    sys::nvrtcDestroyProgram(&prog as *const _ as *mut _).result()
 }
 
 /// Extract the ptx associated with `prog`. Call [compile_program()] before this.
@@ -115,11 +113,11 @@ pub unsafe fn destroy_program(prog: sys::nvrtcProgram) -> Result<(), NvrtcError>
 #[allow(clippy::slow_vector_initialization)]
 pub unsafe fn get_ptx(prog: sys::nvrtcProgram) -> Result<Vec<c_char>, NvrtcError> {
     let mut size: usize = 0;
-    lib().nvrtcGetPTXSize(prog, &mut size as *mut _).result()?;
+    sys::nvrtcGetPTXSize(prog, &mut size as *mut _).result()?;
 
     let mut ptx_src: Vec<c_char> = Vec::with_capacity(size);
     ptx_src.resize(size, 0);
-    lib().nvrtcGetPTX(prog, ptx_src.as_mut_ptr()).result()?;
+    sys::nvrtcGetPTX(prog, ptx_src.as_mut_ptr()).result()?;
     Ok(ptx_src)
 }
 
@@ -134,15 +132,11 @@ pub unsafe fn get_ptx(prog: sys::nvrtcProgram) -> Result<Vec<c_char>, NvrtcError
 #[allow(clippy::slow_vector_initialization)]
 pub unsafe fn get_program_log(prog: sys::nvrtcProgram) -> Result<Vec<c_char>, NvrtcError> {
     let mut size: usize = 0;
-    lib()
-        .nvrtcGetProgramLogSize(prog, &mut size as *mut _)
-        .result()?;
+    sys::nvrtcGetProgramLogSize(prog, &mut size as *mut _).result()?;
 
     let mut log_src: Vec<c_char> = Vec::with_capacity(size);
     log_src.resize(size, 0);
-    lib()
-        .nvrtcGetProgramLog(prog, log_src.as_mut_ptr())
-        .result()?;
+    sys::nvrtcGetProgramLog(prog, log_src.as_mut_ptr()).result()?;
     Ok(log_src)
 }
 
@@ -152,28 +146,28 @@ mod tests {
 
     #[test]
     fn test_compile_program_no_opts() {
-        let prog = create_program("extern \"C\" __global__ void kernel() { }").unwrap();
+        let prog = create_program(c"extern \"C\" __global__ void kernel() { }", None).unwrap();
         unsafe { compile_program::<&str>(prog, &[]) }.unwrap();
         unsafe { destroy_program(prog) }.unwrap();
     }
 
     #[test]
     fn test_compile_program_1_opt() {
-        let prog = create_program("extern \"C\" __global__ void kernel() { }").unwrap();
+        let prog = create_program(c"extern \"C\" __global__ void kernel() { }", None).unwrap();
         unsafe { compile_program(prog, &["--ftz=true"]) }.unwrap();
         unsafe { destroy_program(prog) }.unwrap();
     }
 
     #[test]
     fn test_compile_program_2_opt() {
-        let prog = create_program("extern \"C\" __global__ void kernel() { }").unwrap();
+        let prog = create_program(c"extern \"C\" __global__ void kernel() { }", None).unwrap();
         unsafe { compile_program(prog, &["--ftz=true", "--fmad=true"]) }.unwrap();
         unsafe { destroy_program(prog) }.unwrap();
     }
 
     #[test]
     fn test_compile_bad_program() {
-        let prog = create_program("extern \"C\" __global__ void kernel(").unwrap();
+        let prog = create_program(c"extern \"C\" __global__ void kernel(", None).unwrap();
         assert_eq!(
             unsafe { compile_program::<&str>(prog, &[]) }.unwrap_err(),
             NvrtcError(sys::nvrtcResult::NVRTC_ERROR_COMPILATION)
@@ -182,14 +176,14 @@ mod tests {
 
     #[test]
     fn test_get_ptx() {
-        const SRC: &str =
-            "extern \"C\" __global__ void sin_kernel(float *out, const float *inp, int numel) {
+        const SRC: &CStr =
+            c"extern \"C\" __global__ void sin_kernel(float *out, const float *inp, int numel) {
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i < numel) {
                 out[i] = sin(inp[i]);
             }
         }";
-        let prog = create_program(SRC).unwrap();
+        let prog = create_program(SRC, None).unwrap();
         unsafe { compile_program::<&str>(prog, &[]) }.unwrap();
         let ptx = unsafe { get_ptx(prog) }.unwrap();
         assert!(!ptx.is_empty());
