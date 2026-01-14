@@ -69,7 +69,9 @@ pub fn version_check() -> Result<(), CudnnError> {
         feature = "cuda-12040",
         feature = "cuda-12050",
         feature = "cuda-12060",
-        feature = "cuda-12080"
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000"
     ))]
     unsafe {
         lib().cudnnAdvVersionCheck().result()?;

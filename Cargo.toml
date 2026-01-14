@@ -1,6 +1,6 @@
 [package]
 name = "cudarc"
-version = "0.13.9"
+version = "0.14.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -34,6 +34,8 @@ cuda-12040 = []
 cuda-12050 = []
 cuda-12060 = []
 cuda-12080 = []
+cuda-12090 = []
+cuda-13000 = []
 
 dynamic-linking = []
 

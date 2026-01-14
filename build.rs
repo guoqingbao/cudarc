@@ -6,7 +6,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR");
 
-    let (major, minor): (usize, usize) = if cfg!(feature = "cuda-12080") {
+    let (major, minor): (usize, usize) = if cfg!(feature = "cuda-13000") {
+        (13, 0)
+    } else if cfg!(feature = "cuda-12090") {
+        (12, 9)
+    } else if cfg!(feature = "cuda-12080") {
         (12, 8)
     } else if cfg!(feature = "cuda-12060") {
         (12, 6)
@@ -57,28 +61,21 @@ fn cuda_version_from_build_system() -> (usize, usize) {
         return (12, 8);
     }
 
-    let output = std::process::Command::new("nvcc")
-        .arg("--version")
-        .output()
-        .expect("Failed to execute `nvcc`");
-
-    //retry
-    let output = if !output.status.success() {
-        std::process::Command::new("/usr/local/cuda/bin/nvcc")
-            .arg("--version")
-            .output()
-            .expect("Failed to execute `nvcc`")
-    } else {
-        output
+    let output = match std::process::Command::new("nvcc").arg("--version").output() {
+        Ok(r) => r,
+        _ => {
+            //retry
+            match std::process::Command::new("/usr/local/cuda/bin/nvcc")
+                .arg("--version")
+                .output()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("`nvcc --version` failed {:?}", e);
+                }
+            }
+        }
     };
-
-    if !output.status.success() {
-        panic!(
-            "`nvcc --version` failed.\nstdout:\n{}\n\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version_line = stdout.lines().nth(3).unwrap();
@@ -86,6 +83,8 @@ fn cuda_version_from_build_system() -> (usize, usize) {
     let version_number = release_section.split(' ').nth(1).unwrap();
 
     match version_number {
+        "13.0" => (13, 0),
+        "12.9" => (12, 9),
         "12.8" => (12, 8),
         "12.6" => (12, 6),
         "12.5" => (12, 5),
