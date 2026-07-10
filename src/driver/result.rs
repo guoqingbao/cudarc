@@ -178,9 +178,9 @@ pub mod device {
         let id: sys::CUuuid;
         unsafe {
             let mut uuid = MaybeUninit::uninit();
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020"))]
+            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020", feature = "cuda-13030"))]
             lib().cuDeviceGetUuid_v2(uuid.as_mut_ptr(), dev).result()?;
-            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020")))]
+            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020", feature = "cuda-13030")))]
             lib().cuDeviceGetUuid(uuid.as_mut_ptr(), dev).result()?;
             id = uuid.assume_init();
         }
@@ -1025,11 +1025,11 @@ pub mod event {
     pub unsafe fn elapsed(start: sys::CUevent, end: sys::CUevent) -> Result<f32, DriverError> {
         let mut ms: f32 = 0.0;
         unsafe {
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020"))]
+            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020", feature = "cuda-13030"))]
             lib()
                 .cuEventElapsedTime_v2((&mut ms) as *mut _, start, end)
                 .result()?;
-            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020")))]
+            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020", feature = "cuda-13030")))]
             lib()
                 .cuEventElapsedTime((&mut ms) as *mut _, start, end)
                 .result()?;
