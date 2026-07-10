@@ -73,6 +73,11 @@ mod sys_13000;
 #[cfg(feature = "cuda-13000")]
 pub use sys_13000::*;
 
+#[cfg(feature = "cuda-13010")]
+mod sys_13010;
+#[cfg(feature = "cuda-13010")]
+pub use sys_13010::*;
+
 /// Check if the driver library is available on the system.
 pub fn is_available() -> bool {
     let lib_name = "cuda";
