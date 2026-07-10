@@ -6,7 +6,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR");
 
-    let (major, minor): (usize, usize) = if cfg!(feature = "cuda-13010") {
+    let (major, minor): (usize, usize) = if cfg!(feature = "cuda-13020") {
+        (13, 2)
+    } else if cfg!(feature = "cuda-13010") {
         (13, 1)
     } else if cfg!(feature = "cuda-13000") {
         (13, 0)
@@ -85,6 +87,7 @@ fn cuda_version_from_build_system() -> (usize, usize) {
     let version_number = release_section.split(' ').nth(1).unwrap();
 
     match version_number {
+        "13.2" => (13, 2),
         "13.1" => (13, 1),
         "13.0" => (13, 0),
         "12.9" => (12, 9),

@@ -78,6 +78,11 @@ mod sys_13010;
 #[cfg(feature = "cuda-13010")]
 pub use sys_13010::*;
 
+#[cfg(feature = "cuda-13020")]
+mod sys_13020;
+#[cfg(feature = "cuda-13020")]
+pub use sys_13020::*;
+
 pub unsafe fn lib() -> &'static Lib {
     static LIB: std::sync::OnceLock<Lib> = std::sync::OnceLock::new();
     LIB.get_or_init(|| {
